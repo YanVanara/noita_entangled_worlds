@@ -26,8 +26,28 @@ pub struct Obj(pub usize);
 
 pub struct Color(pub u32);
 
+/// Physics body id as handed out by Noita's `PhysicsBodyIDGetFromEntity`.
+///
+/// Noita hands these out as plain Lua numbers and they are *not* guaranteed to fit in an
+/// `i32` (they are pointer/handle-like values; in long sessions values above 2^31 show up).
+/// We therefore keep the exact Lua number (as an integer) and hand back the very same number,
+/// exactly like a vanilla Lua script would.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PhysicsBodyID(pub i32);
+pub struct PhysicsBodyID(pub i64);
+
+impl PhysicsBodyID {
+    /// Convert the raw Lua number returned by Noita into a body id without losing information.
+    pub fn from_lua_number(n: f64) -> Self {
+        // `f64 as i32` saturates: every id >= 2^31 used to collapse to 2147483647, which then
+        // failed every `PhysicsBodyIDGetTransform` call. `i64` holds every integer Lua can give us.
+        Self(n as i64)
+    }
+
+    /// The exact Lua number to pass back to Noita.
+    pub fn to_lua_number(self) -> f64 {
+        self.0 as f64
+    }
+}
 
 pub trait Component: From<ComponentID> + Into<ComponentID> + Deref<Target = ComponentID> {
     const NAME_STR: &'static str;
@@ -36,11 +56,16 @@ pub trait Component: From<ComponentID> + Into<ComponentID> + Deref<Target = Comp
 noita_api_macro::generate_components!();
 
 static TO_ID: LazyLock<Vec<String>> = LazyLock::new(|| {
-    let file = raw::mod_text_file_get_content("data/scripts/status_effects/status_list.lua".into())
-        .unwrap();
+    // Never panic here: a panic inside the game process aborts Noita. A missing/odd file just
+    // means stains won't be synced.
+    let Ok(file) =
+        raw::mod_text_file_get_content("data/scripts/status_effects/status_list.lua".into())
+    else {
+        return Vec::new();
+    };
     file.lines()
         .filter(|l| !l.starts_with("-") && l.contains("id=\"") && !l.contains("BRAIN_DAMAGE"))
-        .map(|l| l.split("\"").map(|a| a.to_string()).nth(1).unwrap())
+        .filter_map(|l| l.split("\"").nth(1).map(|a| a.to_string()))
         .collect::<Vec<String>>()
 });
 impl GameEffectComponent {
@@ -871,7 +896,7 @@ pub mod raw {
     pub fn physics_body_id_get_transform(body: PhysicsBodyID) -> eyre::Result<Option<PhysData>> {
         let lua = LuaState::current()?;
         lua.get_global(c"PhysicsBodyIDGetTransform");
-        lua.push_integer(body.0 as isize);
+        lua.push_number(body.to_lua_number());
         lua.call(1, 6)
             .wrap_err("Failed to call PhysicsBodyIDGetTransform")?;
         if lua.is_nil_or_none(-1) {
@@ -1809,8 +1834,32 @@ pub fn get_file<'a>(
             let content = raw::mod_text_file_get_content(entry.key().clone())?;
             let mut split = content.split("name=\"");
             split.next();
-            let split = split.map(|piece| piece.split_once("\"").unwrap().0.to_string());
+            // A sprite xml from some other mod with an unterminated `name="` must not panic
+            // (= abort the game); just skip that entry.
+            let split = split.filter_map(|piece| piece.split_once("\"").map(|(name, _)| name.to_string()));
             Ok(entry.insert(split.collect::<Vec<String>>()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PhysicsBodyID;
+
+    /// Body ids must survive a Lua -> Rust -> Lua round trip unchanged, including values that
+    /// do not fit in an i32 (observed in the wild as
+    /// `PhysicsBodyIDGetTransform ... couldn't find body with id: 2147483647`).
+    #[test]
+    fn physics_body_id_round_trips_large_values() {
+        for n in [0.0, 1.0, 12345.0, 2147483647.0, 2147483648.0, 3_000_000_000.0, 4294967295.0] {
+            let id = PhysicsBodyID::from_lua_number(n);
+            assert_eq!(id.to_lua_number(), n, "body id {n} was mangled");
+        }
+    }
+
+    #[test]
+    fn physics_body_id_keeps_negative_values() {
+        let id = PhysicsBodyID::from_lua_number(-5.0);
+        assert_eq!(id.to_lua_number(), -5.0);
     }
 }

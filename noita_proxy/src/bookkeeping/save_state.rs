@@ -55,8 +55,21 @@ impl SaveState {
         let path = self.path_for_filename(D::FILENAME);
         let encoded = bitcode::encode(data);
         let compressed = lz4_flex::compress_prepend_size(&encoded);
-        if let Err(err) = fs::write(&path, compressed) {
+        // Write to a temporary file and rename it into place: saves now also happen while the
+        // run is in progress (periodically / on Noita disconnect), possibly from several threads,
+        // and a crash mid-write must never leave a truncated snapshot behind.
+        static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp_path = self.path.join(format!(
+            "{}.{}.{}.tmp",
+            D::FILENAME,
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, atomic::Ordering::Relaxed)
+        ));
+        let result = fs::write(&tmp_path, compressed).and_then(|_| fs::rename(&tmp_path, &path));
+        if let Err(err) = result {
             error!("Error while saving to {:?}: {err}", D::FILENAME);
+            let _ = fs::remove_file(&tmp_path);
+            return;
         }
         info!("Saved {}", path.display());
     }

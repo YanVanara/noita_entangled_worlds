@@ -13,7 +13,7 @@ use crate::bookkeeping::save_state::{SaveState, SaveStateEntry};
 
 use super::omni::OmniPeerId;
 
-#[derive(Encode, Decode, Default)]
+#[derive(Encode, Decode, Default, Clone)]
 struct EntityStorage {
     entities: FxHashMap<Gid, FullEntityData>,
 }
@@ -199,6 +199,24 @@ impl DesManager {
         self.rtree = RTree::default();
         self.authority.clear();
         self.pending_messages.clear();
+    }
+
+    /// True if we hold synced entities (of some run).
+    pub(crate) fn has_stored_data(&self) -> bool {
+        !self.entity_storage.entities.is_empty()
+    }
+
+    /// Persist the entity storage now (host only), on a helper thread from a clone.
+    pub(crate) fn save_snapshot(&self) {
+        if !self.is_host {
+            return;
+        }
+        let storage = self.entity_storage.clone();
+        let save_state = self.save_state.clone();
+        std::thread::spawn(move || {
+            save_state.save(&storage);
+            info!("Saved entity storage (snapshot)");
+        });
     }
 }
 

@@ -389,6 +389,11 @@ function OnWorldInitialized() -- This is called once the game world is initializ
     else
         GameRemoveFlagRun("ew_flag_this_is_host")
     end
+    -- Let the proxy know how old this world is: the frame counter is saved with the run, so a
+    -- value near 0 means "New Game" and the proxy must not replay a previous run's state into it.
+    if not net.connect_failed then
+        net.proxy_send("world_frame", tostring(GameGetFrameNum()))
+    end
     ctx.hook.on_world_initialized()
 end
 

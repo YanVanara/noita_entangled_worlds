@@ -656,6 +656,32 @@ impl WorldManager {
         self.chunk_last_update.clear();
         self.chunk_state.clear();
         self.is_storage_recent.clear();
+        self.last_request_priority.clear();
+        // Pending "nice terraforming" explosions belong to the run that is being thrown away;
+        // keeping them meant they got applied to chunks of the *next* run when those coordinates
+        // were first loaded.
+        self.explosion_pointer.clear();
+        self.explosion_data.clear();
+        self.explosion_heap.clear();
+    }
+
+    /// True if we hold chunk data (of some run) that would be pushed into Noita on load.
+    pub(crate) fn has_stored_data(&self) -> bool {
+        !self.chunk_storage.is_empty()
+    }
+
+    /// Persist the stored chunks now (host only). Encoding the whole explored world can take a
+    /// while, so it's done on a helper thread from a clone.
+    pub(crate) fn save_snapshot(&self) {
+        if !self.is_host {
+            return;
+        }
+        let chunks = self.chunk_storage.clone();
+        let save_state = self.save_state.clone();
+        std::thread::spawn(move || {
+            save_state.save(&chunks);
+            info!("Saved chunk data (snapshot)");
+        });
     }
 
     pub(crate) fn get_emitted_msgs(&mut self) -> Vec<MessageRequest<WorldNetMessage>> {

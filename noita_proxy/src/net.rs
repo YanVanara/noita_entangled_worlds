@@ -72,6 +72,11 @@ pub(crate) fn ws_encode_mod(peer: OmniPeerId, data: &[u8]) -> NoitaInbound {
     NoitaInbound::RawMessage(buf)
 }
 
+/// How often the host proxy snapshots its run state to disk while playing.
+const RUN_STATE_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(180);
+/// A world frame number below this at `OnWorldInitialized` means Noita started a new run.
+const NEW_RUN_FRAME_THRESHOLD: i64 = 120;
+
 #[derive(Encode, Decode)]
 pub(crate) struct RunInfo {
     pub(crate) seed: u64,
@@ -426,6 +431,7 @@ impl NetManager {
             audio: audio_state,
         };
         let mut last_iter = Instant::now();
+        let mut last_save = Instant::now();
         let path = crate::player_path(self.init_settings.paths.noita_quantew_install.clone());
         let player_image = if path.exists() {
             image::open(path)
@@ -573,7 +579,14 @@ impl NetManager {
                 if self.is_host() {
                     state.des.noita_disconnected(self.peer.my_id());
                 }
+                // Noita just closed (or crashed): snapshot what we have so the proxy-side state
+                // stays close to Noita's own save even if the proxy never exits cleanly.
+                self.save_run_state(&state);
                 state.had_a_disconnect = false;
+            }
+            if self.is_host() && last_save.elapsed() >= RUN_STATE_AUTOSAVE_INTERVAL {
+                self.save_run_state(&state);
+                last_save = Instant::now();
             }
 
             let des_pending = state.des.pending_messages();
@@ -972,6 +985,9 @@ impl NetManager {
 
     fn on_ms_connection(self: &Arc<NetManager>, state: &mut NetInnerState) {
         self.init_settings.save_state.mark_game_started();
+        // Persist the run seed right away: it used to be written only when the proxy shut down
+        // cleanly, so a proxy crash / kill lost it and the next "Continue" got a different seed.
+        self.save_run_info();
         info!("New stream connected");
 
         let settings = self.settings.lock().unwrap();
@@ -1283,6 +1299,32 @@ impl NetManager {
         );
     }
 
+    /// Persist the run seed (host only).
+    fn save_run_info(&self) {
+        if self.is_host() {
+            let run_info = RunInfo {
+                seed: self.settings.lock().unwrap().seed,
+            };
+            self.init_settings.save_state.save(&run_info);
+            info!("Saved run info");
+        } else {
+            info!("Skip saving run info: not a host");
+        }
+    }
+
+    /// Persist everything the proxy knows about the current run (host only): seed, flags,
+    /// synced entities and stored chunks. Previously all of this was written exclusively from
+    /// `Drop` impls, i.e. only on a clean lobby exit.
+    fn save_run_state(&self, state: &NetInnerState) {
+        if !self.is_host() {
+            return;
+        }
+        self.save_run_info();
+        self.init_settings.save_state.save(&state.flags);
+        state.des.save_snapshot();
+        state.world.save_snapshot();
+    }
+
     fn is_host(&self) -> bool {
         self.peer.is_host()
     }
@@ -1338,6 +1380,34 @@ impl NetManager {
                 self.is_polied.store(polied, Ordering::Relaxed);
                 let cess = msg.next().and_then(|s| s.parse().ok()) == Some(1);
                 self.is_cess.store(cess, Ordering::Relaxed);
+            }
+            Some("world_frame") => {
+                // Sent by the mod from OnWorldInitialized with GameGetFrameNum(). Noita's frame
+                // counter is part of the save, so a value near 0 means "New Game" was pressed.
+                // The proxy can't otherwise tell New Game from Continue, and it happily replayed
+                // the previous run's chunks/entities/flags over a brand new world.
+                let frame: Option<i64> = msg.next().and_then(|s| s.parse().ok());
+                if let Some(frame) = frame
+                    && self.is_host()
+                    && frame < NEW_RUN_FRAME_THRESHOLD
+                    && (state.world.has_stored_data()
+                        || state.des.has_stored_data()
+                        || !state.flags.is_empty())
+                {
+                    warn!(
+                        "Host started a fresh run (world frame {frame}) but the proxy still held \
+                         state from a previous run; discarding it so the old run doesn't bleed \
+                         into the new one"
+                    );
+                    state.world.reset();
+                    state.des.reset();
+                    state.flags.clear();
+                    self.reset_map.store(true, Ordering::Relaxed);
+                    self.init_settings.save_state.reset();
+                    self.save_run_state(state);
+                    // Make the other proxies drop their world/entity models as well.
+                    self.resend_game_settings();
+                }
             }
             Some("reset_world") => {
                 state.world.reset();
@@ -1617,15 +1687,7 @@ pub enum LiquidType {
 
 impl Drop for NetManager {
     fn drop(&mut self) {
-        if self.is_host() {
-            let run_info = RunInfo {
-                seed: self.settings.lock().unwrap().seed,
-            };
-            self.init_settings.save_state.save(&run_info);
-            info!("Saved run info");
-        } else {
-            info!("Skip saving run info: not a host");
-        }
+        self.save_run_info();
     }
 }
 

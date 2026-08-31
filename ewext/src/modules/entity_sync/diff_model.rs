@@ -217,9 +217,18 @@ impl RemoteDiffModel {
             .copied()
     }
     pub(crate) fn remove_entities(self, entity_manager: &mut EntityManager) -> eyre::Result<()> {
+        // Replicas are routinely already dead; one of those must not abort the loop, otherwise
+        // every remaining replica of this peer is left behind as an immortal, AI-less husk.
         for (_, ent) in self.tracked.into_iter() {
-            entity_manager.set_current_entity(ent)?;
-            safe_entitykill(entity_manager);
+            if !ent.is_alive() {
+                entity_manager.remove_ent(&ent);
+                continue;
+            }
+            if entity_manager.set_current_entity(ent).is_ok() {
+                safe_entitykill(entity_manager);
+            } else {
+                ent.kill();
+            }
         }
         Ok(())
     }
@@ -1086,6 +1095,13 @@ impl LocalDiffModel {
                     damage.set_max_hp(entity_data.hp as f64)?;
                 }
                 damage.set_hp(entity_data.hp as f64)?;
+                if entity_manager.has_tag(const { CachedTag::from_tag("boss_centipede") }) {
+                    // The stored boss blob is the dormant, pre-fight one, so vanilla
+                    // `init_boss()` will run again when this copy wakes up and reset hp to full.
+                    // Stash the synced value; kolmi/append/boss_update.lua restores it.
+                    let var = entity.get_var_or_default("ew_synced_hp")?;
+                    var.set_value_float(entity_data.hp)?;
+                }
             }
             if !entity_data.drops_gold {
                 let n = entity_manager
@@ -2417,9 +2433,13 @@ fn item_in_my_inventory(entity: EntityID) -> Result<bool, eyre::Error> {
 }
 
 fn item_in_entity_inventory(entity: EntityID) -> Result<bool, eyre::Error> {
+    // The root entity is not necessarily something we track (e.g. a local NPC/ghost that picked
+    // the replica up), so it may well have no `ew_gid_lid` variable. That used to be an
+    // `unwrap()`, i.e. a panic -> with `panic = "abort"` an instant Noita crash.
     Ok(entity
         .root()?
-        .and_then(|e| e.get_var("ew_gid_lid").unwrap().value_bool().ok())
+        .and_then(|e| e.get_var("ew_gid_lid"))
+        .and_then(|var| var.value_bool().ok())
         .unwrap_or(false))
 }
 

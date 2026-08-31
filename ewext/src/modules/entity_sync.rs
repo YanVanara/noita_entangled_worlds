@@ -527,7 +527,10 @@ impl Module for EntitySync {
     /// Looks for newly spawned entities that might need to be tracked.
     fn on_new_entity(&mut self, ent: isize, kill: bool) -> eyre::Result<()> {
         let entity = EntityID::try_from(ent)?;
-        if !kill && !entity.is_alive() {
+        // An id that is already dead (killed earlier in this frame by another hook) has nothing
+        // for us to do; asking the game about it would only error out and abort the whole batch,
+        // leaving every later entity of the frame untracked / un-deduplicated.
+        if !entity.is_alive() {
             return Ok(());
         }
         if entity.0 <= self.look_current_entity.0 {

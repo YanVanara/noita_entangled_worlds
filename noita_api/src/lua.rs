@@ -233,9 +233,13 @@ impl<R: LuaFnRet> LuaFnRet for eyre::Result<R> {
     fn do_return(self, lua: LuaState) -> c_int {
         match self {
             Ok(ok) => ok.do_return(lua),
-            Err(err) => unsafe {
-                lua.raise_error(format!("Error in rust call: {err:?}"));
-            },
+            Err(err) => {
+                // `raise_error` longjmps out and never returns: anything still owned on this
+                // frame leaks. Format first, then drop the report explicitly.
+                let msg = format!("Error in rust call: {err:?}");
+                drop(err);
+                unsafe { lua.raise_error(msg) }
+            }
         }
     }
 }
@@ -360,7 +364,8 @@ impl LuaPutValue for Obj {
 
 impl LuaPutValue for PhysicsBodyID {
     fn put(&self, lua: LuaState) {
-        lua.push_integer(self.0 as isize);
+        // Pass the id back exactly as Noita gave it to us (see `PhysicsBodyID`).
+        lua.push_number(self.to_lua_number());
     }
 }
 
@@ -502,7 +507,7 @@ impl LuaGetValue for PhysicsBodyID {
     where
         Self: Sized,
     {
-        Ok(PhysicsBodyID(lua.to_number(index) as i32))
+        Ok(PhysicsBodyID::from_lua_number(lua.to_number(index)))
     }
 }
 
